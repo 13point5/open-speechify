@@ -868,15 +868,46 @@ const weightMapper = new WeightMapper({
   autoCamelCase: true,
 });
 
+export function float16ToFloat32(data: Uint16Array) {
+  const out = new Float32Array(data.length);
+  for (let i = 0; i < data.length; i += 1) {
+    const half = data[i];
+    const sign = (half & 0x8000) ? -1 : 1;
+    const exp = (half >> 10) & 0x1f;
+    const mant = half & 0x03ff;
+
+    if (exp === 0) {
+      out[i] = mant === 0 ? sign * 0 : sign * Math.pow(2, -14) * (mant / 1024);
+      continue;
+    }
+
+    if (exp === 0x1f) {
+      out[i] = mant ? NaN : sign * Infinity;
+      continue;
+    }
+
+    out[i] = sign * Math.pow(2, exp - 15) * (1 + mant / 1024);
+  }
+  return out;
+}
+
 export function fromSafetensors(file: safetensors.File): PocketTTS {
   const mappedWeights = weightMapper.mapObject(file.tensors);
   const hydrated: Record<string, np.Array> = {};
   for (const [key, value] of Object.entries(mappedWeights)) {
     if (value.dtype === "F16") {
-      hydrated[key] = np.array(value.data as Uint16Array, {
-        dtype: np.float16,
-        shape: value.shape,
-      });
+      const rawData = new Uint16Array(
+        value.data.buffer,
+        value.data.byteOffset,
+        value.data.byteLength / 2,
+      );
+      const weightData = float16ToFloat32(rawData);
+      hydrated[key] = np
+        .array(weightData, {
+          dtype: np.float32,
+          shape: value.shape,
+        })
+        .astype(np.float16);
     } else {
       throw new Error(`Unexpected dtype ${value.dtype} for weight ${key}`);
     }

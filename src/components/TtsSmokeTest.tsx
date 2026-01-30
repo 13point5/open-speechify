@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { createStreamingPlayer } from "@/tts/audio";
 import { playTTS } from "@/tts/inference";
-import { fromSafetensors, type PocketTTS } from "@/tts/pocket-tts";
+import { float16ToFloat32, fromSafetensors, type PocketTTS } from "@/tts/pocket-tts";
 
 const WEIGHTS_URL =
   "https://huggingface.co/ekzhang/jax-js-models/resolve/main/kyutai-pocket-tts_b6369a24-fp16.safetensors";
@@ -134,8 +134,18 @@ export function TtsSmokeTest() {
       const audioPrompt = safetensors.parse(
         await cachedFetch(DEFAULT_VOICE_URL),
       ).tensors.audio_prompt;
+      const audioPromptData =
+        audioPrompt.dtype === "F16"
+          ? float16ToFloat32(
+              new Uint16Array(
+                audioPrompt.data.buffer,
+                audioPrompt.data.byteOffset,
+                audioPrompt.data.byteLength / 2,
+              ),
+            )
+          : new Float32Array(audioPrompt.data as Float32Array);
       const voiceEmbed = np
-        .array(audioPrompt.data as Float32Array, {
+        .array(audioPromptData, {
           shape: audioPrompt.shape,
           dtype: np.float32,
         })
