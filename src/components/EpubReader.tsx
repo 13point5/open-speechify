@@ -623,7 +623,7 @@ export function EpubReader() {
           stopPlayback();
           setTimeout(() => {
             void playQueue();
-          }, 0);
+          }, 100);
         });
       });
 
