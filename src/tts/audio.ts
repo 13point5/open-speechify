@@ -2,6 +2,7 @@ const SAMPLE_RATE = 24000; // 24kHz sample rate for Mimi codec
 
 export interface AudioPlayer {
   playChunk(samples: Float32Array): Promise<void>;
+  waitForEnd(): Promise<void>;
   close(): Promise<void>;
   toWav(): Blob;
   readonly context: AudioContext;
@@ -54,15 +55,18 @@ function writeString(view: DataView, offset: number, str: string) {
   }
 }
 
-export function createStreamingPlayer(): AudioPlayer {
+export function createStreamingPlayer(options?: {
+  autoResume?: boolean;
+}): AudioPlayer {
   const audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
   let nextStartTime = audioCtx.currentTime;
   let lastEndedPromise: Promise<void> = Promise.resolve();
   const chunks: Float32Array[] = [];
+  const autoResume = options?.autoResume ?? true;
 
   return {
     async playChunk(samples: Float32Array) {
-      if (audioCtx.state === "suspended") {
+      if (autoResume && audioCtx.state === "suspended") {
         await audioCtx.resume();
       }
 
@@ -82,6 +86,10 @@ export function createStreamingPlayer(): AudioPlayer {
       lastEndedPromise = new Promise((resolve) => {
         source.onended = () => resolve();
       });
+    },
+
+    async waitForEnd() {
+      await lastEndedPromise;
     },
 
     async close() {

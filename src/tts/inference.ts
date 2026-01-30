@@ -101,7 +101,7 @@ export async function playTTS(
     }
   } finally {
     sequence.dispose();
-    tree.dispose([model, embeds]);
+    tree.dispose([embeds]);
     await audioPromise;
   }
 }

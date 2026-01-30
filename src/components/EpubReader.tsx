@@ -1,31 +1,305 @@
 import type { ChangeEvent } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ePub from "epubjs";
-
-import { UploadCloud } from "lucide-react";
+import { defaultDevice, init, numpy as np, tree } from "@jax-js/jax";
+import { cachedFetch, safetensors, tokenizers } from "@jax-js/loaders";
+import { Pause, Play, UploadCloud } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import type { AudioPlayer } from "@/tts/audio";
+import { createStreamingPlayer } from "@/tts/audio";
+import { playTTS } from "@/tts/inference";
+import { fromSafetensors, type PocketTTS } from "@/tts/pocket-tts";
+
+const WEIGHTS_URL =
+  "https://huggingface.co/ekzhang/jax-js-models/resolve/main/kyutai-pocket-tts_b6369a24-fp16.safetensors";
+const HF_URL_PREFIX =
+  "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/fbf8280";
+const DEFAULT_VOICE_URL = `${HF_URL_PREFIX}/embeddings/azelma.safetensors`;
+const TOKENIZER_URL = `${HF_URL_PREFIX}/tokenizer.model`;
+
+const BLOCK_SELECTOR =
+  "p,li,blockquote,figcaption,dd,dt,td,th,h1,h2,h3,h4,h5,h6,pre";
+const HIGHLIGHT_STYLES = {
+  fill: "#fde047",
+  "fill-opacity": "0.35",
+  "mix-blend-mode": "multiply",
+};
 
 type EpubRendition = {
-  display: () => Promise<void>;
+  display: (target?: string) => Promise<void>;
   flow: (flowMode: string) => void;
   destroy: () => void;
   themes: {
     default: (theme: Record<string, Record<string, string>>) => void;
   };
+  hooks?: {
+    content?: {
+      register: (callback: (contents: any) => void) => void;
+    };
+  };
+  annotations?: {
+    highlight: (
+      cfiRange: string,
+      data?: Record<string, unknown>,
+      cb?: (event: unknown) => void,
+      className?: string,
+      styles?: Record<string, string>,
+    ) => unknown;
+    remove: (cfiRange: string, type?: string) => void;
+  };
 };
+
+type SentenceEntry = {
+  id: string;
+  text: string;
+  cfiRange: string;
+  sectionIndex: number;
+  order: number;
+};
+
+type TextMapEntry = {
+  node: Text;
+  start: number;
+  end: number;
+};
+
+const segmenterCache = new Map<string, Intl.Segmenter>();
+
+function getSegmenter(language: string | null) {
+  if (typeof Intl === "undefined" || !("Segmenter" in Intl)) return null;
+  const lang = language?.trim() || "en";
+  if (!segmenterCache.has(lang)) {
+    segmenterCache.set(lang, new Intl.Segmenter(lang, { granularity: "sentence" }));
+  }
+  return segmenterCache.get(lang) ?? null;
+}
+
+function splitIntoSentences(text: string, language: string | null) {
+  if (!text) return [] as { text: string; start: number; end: number }[];
+  const segmenter = getSegmenter(language);
+  if (segmenter) {
+    return Array.from(segmenter.segment(text)).map((segment) => ({
+      text: segment.segment,
+      start: segment.index,
+      end: segment.index + segment.segment.length,
+    }));
+  }
+
+  const matches = Array.from(text.matchAll(/[^.!?]+[.!?]+|[^.!?]+$/g));
+  return matches.map((match) => ({
+    text: match[0],
+    start: match.index ?? 0,
+    end: (match.index ?? 0) + match[0].length,
+  }));
+}
+
+function normalizeSentence(text: string) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function trimOffsets(text: string, start: number, end: number) {
+  let s = start;
+  let e = end;
+  while (s < e && /\s/.test(text[s])) s += 1;
+  while (e > s && /\s/.test(text[e - 1])) e -= 1;
+  return { start: s, end: e };
+}
+
+function buildTextMap(doc: Document, block: Element) {
+  const walker = doc.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => {
+      const parent = node.parentElement;
+      if (!parent) return NodeFilter.FILTER_REJECT;
+      if (parent.closest("script, style, pre, code, kbd, samp")) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+
+  const map: TextMapEntry[] = [];
+  let fullText = "";
+  let offset = 0;
+
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    const value = node.nodeValue ?? "";
+    if (value === "") continue;
+    const start = offset;
+    const end = offset + value.length;
+    map.push({ node, start, end });
+    fullText += value;
+    offset = end;
+  }
+
+  return { fullText, map };
+}
+
+function positionForOffset(map: TextMapEntry[], offset: number) {
+  for (const entry of map) {
+    if (offset >= entry.start && offset <= entry.end) {
+      return {
+        node: entry.node,
+        offset: Math.max(0, Math.min(entry.node.nodeValue?.length ?? 0, offset - entry.start)),
+      };
+    }
+  }
+  return null;
+}
+
+function rangeFromOffsets(doc: Document, map: TextMapEntry[], start: number, end: number) {
+  const startPos = positionForOffset(map, start);
+  const endPos = positionForOffset(map, end);
+  if (!startPos || !endPos) return null;
+  const range = doc.createRange();
+  range.setStart(startPos.node, startPos.offset);
+  range.setEnd(endPos.node, endPos.offset);
+  return range;
+}
+
+function prepareTextPrompt(text: string): [string, number] {
+  let normalized = text.trim();
+  if (normalized === "") throw new Error("Prompt cannot be empty");
+  normalized = normalized.replace(/\s+/g, " ");
+  const numberOfWords = normalized.split(" ").length;
+  let framesAfterEosGuess = 3;
+  if (numberOfWords <= 4) {
+    framesAfterEosGuess = 5;
+  }
+
+  normalized = normalized.replace(/^(\p{Ll})/u, (c) => c.toLocaleUpperCase());
+  if (/[\p{L}\p{N}]$/u.test(normalized)) {
+    normalized = normalized + ".";
+  }
+  if (normalized.split(" ").length < 5) {
+    normalized = " ".repeat(8) + normalized;
+  }
+
+  return [normalized, framesAfterEosGuess];
+}
 
 export function EpubReader() {
   const viewerRef = useRef<HTMLDivElement | null>(null);
   const bookRef = useRef<any>(null);
   const renditionRef = useRef<EpubRendition | null>(null);
 
+  const processedDocsRef = useRef<WeakSet<Document>>(new WeakSet());
+  const sentencesBySectionRef = useRef<Map<number, SentenceEntry[]>>(new Map());
+  const sentenceListRef = useRef<SentenceEntry[]>([]);
+  const sentenceIdCounterRef = useRef(0);
+  const activeHighlightRef = useRef<string | null>(null);
+
+  const weightsRef = useRef<ReturnType<typeof safetensors.parse> | null>(null);
+  const modelRef = useRef<PocketTTS | null>(null);
+  const tokenizerRef = useRef<tokenizers.Unigram | null>(null);
+  const voiceEmbedRef = useRef<np.Array | null>(null);
+  const playerRef = useRef<AudioPlayer | null>(null);
+  const playbackIndexRef = useRef(0);
+  const stopRequestedRef = useRef(false);
+  const isPausedRef = useRef(false);
+  const resumeResolverRef = useRef<(() => void) | null>(null);
+  const stopResolverRef = useRef<(() => void) | null>(null);
+  const webgpuInitializedRef = useRef(false);
+
   const [fileName, setFileName] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sentenceCount, setSentenceCount] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [ttsStatus, setTtsStatus] = useState<string | null>(null);
+  const [ttsError, setTtsError] = useState<string | null>(null);
+  const [webgpuSupported, setWebgpuSupported] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function checkWebGpu() {
+      if (!navigator.gpu) {
+        if (!cancelled) setWebgpuSupported(false);
+        return;
+      }
+
+      try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!cancelled) setWebgpuSupported(Boolean(adapter));
+      } catch {
+        if (!cancelled) setWebgpuSupported(false);
+      }
+    }
+
+    void checkWebGpu();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const rebuildSentenceList = useCallback(() => {
+    const sections = Array.from(sentencesBySectionRef.current.entries()).sort(
+      ([a], [b]) => a - b,
+    );
+    const all: SentenceEntry[] = [];
+    for (const [, entries] of sections) {
+      all.push(...entries.sort((a, b) => a.order - b.order));
+    }
+    sentenceListRef.current = all;
+    setSentenceCount(all.length);
+  }, []);
+
+  const clearHighlight = useCallback(() => {
+    const rendition = renditionRef.current;
+    if (!rendition?.annotations || !activeHighlightRef.current) return;
+    rendition.annotations.remove(activeHighlightRef.current, "highlight");
+    activeHighlightRef.current = null;
+  }, []);
+
+  const highlightSentence = useCallback((entry: SentenceEntry | null) => {
+    const rendition = renditionRef.current;
+    if (!rendition?.annotations) return;
+    if (activeHighlightRef.current) {
+      rendition.annotations.remove(activeHighlightRef.current, "highlight");
+    }
+    if (entry) {
+      rendition.annotations.highlight(
+        entry.cfiRange,
+        { id: entry.id },
+        undefined,
+        "tts-highlight",
+        HIGHLIGHT_STYLES,
+      );
+      activeHighlightRef.current = entry.cfiRange;
+    } else {
+      activeHighlightRef.current = null;
+    }
+  }, []);
+
+  const stopPlayback = useCallback(() => {
+    stopRequestedRef.current = true;
+    if (resumeResolverRef.current) {
+      resumeResolverRef.current();
+      resumeResolverRef.current = null;
+    }
+    if (stopResolverRef.current) {
+      stopResolverRef.current();
+      stopResolverRef.current = null;
+    }
+    if (playerRef.current?.context?.state === "running") {
+      void playerRef.current.context.suspend();
+    }
+    clearHighlight();
+    setIsPlaying(false);
+    setIsPaused(false);
+    setTtsStatus(null);
+  }, [clearHighlight]);
 
   const clearBook = useCallback(() => {
+    stopPlayback();
     if (renditionRef.current) {
       renditionRef.current.destroy();
       renditionRef.current = null;
@@ -37,13 +311,263 @@ export function EpubReader() {
     if (viewerRef.current) {
       viewerRef.current.innerHTML = "";
     }
-  }, []);
+    processedDocsRef.current = new WeakSet();
+    sentencesBySectionRef.current.clear();
+    sentenceListRef.current = [];
+    sentenceIdCounterRef.current = 0;
+    playbackIndexRef.current = 0;
+    activeHighlightRef.current = null;
+    setSentenceCount(0);
+    setTtsError(null);
+  }, [stopPlayback]);
 
   useEffect(() => {
     return () => {
       clearBook();
     };
   }, [clearBook]);
+
+  const ensureWebGpuReady = useCallback(async () => {
+    if (webgpuSupported === false) {
+      throw new Error("WebGPU is not available on this device.");
+    }
+    if (!webgpuInitializedRef.current) {
+      const devices = await init();
+      if (!devices.includes("webgpu")) {
+        setWebgpuSupported(false);
+        throw new Error("WebGPU is not available on this device.");
+      }
+      defaultDevice("webgpu");
+      webgpuInitializedRef.current = true;
+      setWebgpuSupported(true);
+    }
+  }, [webgpuSupported]);
+
+  const downloadWeights = useCallback(async () => {
+    if (weightsRef.current) return weightsRef.current;
+    setTtsStatus("Downloading model weights...");
+    const data = await cachedFetch(WEIGHTS_URL);
+    const parsed = safetensors.parse(data);
+    weightsRef.current = parsed;
+    return parsed;
+  }, []);
+
+  const getModel = useCallback(async () => {
+    if (modelRef.current) return modelRef.current;
+    setTtsStatus("Loading TTS model...");
+    const weights = await downloadWeights();
+    const model = fromSafetensors(weights);
+    modelRef.current = model;
+    return model;
+  }, [downloadWeights]);
+
+  const getTokenizer = useCallback(async () => {
+    if (tokenizerRef.current) return tokenizerRef.current;
+    setTtsStatus("Loading tokenizer...");
+    const tokenizer = await tokenizers.loadSentencePiece(TOKENIZER_URL);
+    tokenizerRef.current = tokenizer;
+    return tokenizer;
+  }, []);
+
+  const getVoiceEmbed = useCallback(async () => {
+    if (voiceEmbedRef.current) return voiceEmbedRef.current;
+    setTtsStatus("Loading voice preset...");
+    const audioPrompt = safetensors.parse(
+      await cachedFetch(DEFAULT_VOICE_URL),
+    ).tensors.audio_prompt;
+    const audioPromptData = audioPrompt.data as Float32Array<ArrayBuffer>;
+    const voiceEmbed = np
+      .array(audioPromptData, {
+        shape: audioPrompt.shape,
+        dtype: np.float32,
+      })
+      .slice(0)
+      .astype(np.float16);
+    voiceEmbedRef.current = voiceEmbed;
+    return voiceEmbed;
+  }, []);
+
+  const synthesizeSentence = useCallback(
+    async (text: string, player: AudioPlayer) => {
+      const model = await getModel();
+      const tokenizer = await getTokenizer();
+      const voiceEmbed = await getVoiceEmbed();
+      const [prompt, framesAfterEos] = prepareTextPrompt(text);
+      const tokens = tokenizer.encode(prompt);
+
+      const tokensAr = np.array(tokens, { dtype: np.uint32 });
+      const textEmbeds = model.flowLM.conditionerEmbed.ref.slice(tokensAr);
+      const embeds = np.concatenate([voiceEmbed.ref, textEmbeds]);
+
+      await playTTS(player, tree.ref(model), embeds, { framesAfterEos });
+    },
+    [getModel, getTokenizer, getVoiceEmbed],
+  );
+
+  const ensureSentenceVisible = useCallback(async (entry: SentenceEntry) => {
+    const rendition = renditionRef.current;
+    if (!rendition) return;
+    try {
+      await rendition.display(entry.cfiRange);
+    } catch {
+      // ignore scroll errors
+    }
+  }, []);
+
+  const playQueue = useCallback(async () => {
+    if (isPlaying) return;
+    const sentences = sentenceListRef.current;
+    if (!sentences.length) {
+      setTtsError("No sentences found yet. Try scrolling to load more.");
+      return;
+    }
+
+    stopRequestedRef.current = false;
+    setIsPlaying(true);
+    setIsPaused(false);
+    setTtsError(null);
+    setTtsStatus("Preparing TTS...");
+
+    try {
+      await ensureWebGpuReady();
+      const player =
+        playerRef.current ?? createStreamingPlayer({ autoResume: false });
+      playerRef.current = player;
+      if (player.context.state === "suspended") {
+        await player.context.resume();
+      }
+
+      const stopPromise = new Promise<void>((resolve) => {
+        stopResolverRef.current = resolve;
+      });
+
+      if (playbackIndexRef.current >= sentences.length) {
+        playbackIndexRef.current = 0;
+      }
+
+      for (
+        let index = playbackIndexRef.current;
+        index < sentences.length;
+        index += 1
+      ) {
+        if (stopRequestedRef.current) break;
+        const entry = sentences[index];
+        playbackIndexRef.current = index;
+        await ensureSentenceVisible(entry);
+        highlightSentence(entry);
+        setTtsStatus(`Reading ${index + 1} of ${sentences.length}`);
+        await synthesizeSentence(entry.text, player);
+        await Promise.race([player.waitForEnd(), stopPromise]);
+
+        if (stopRequestedRef.current) break;
+        if (isPausedRef.current) {
+          setTtsStatus("Paused");
+          await new Promise<void>((resolve) => {
+            resumeResolverRef.current = resolve;
+          });
+          resumeResolverRef.current = null;
+        }
+      }
+    } catch (playError) {
+      setTtsError(
+        playError instanceof Error ? playError.message : "Playback failed.",
+      );
+    } finally {
+      stopResolverRef.current = null;
+      setIsPlaying(false);
+      setIsPaused(false);
+      setTtsStatus(null);
+    }
+  }, [ensureSentenceVisible, ensureWebGpuReady, highlightSentence, isPlaying, synthesizeSentence]);
+
+  const handleTogglePlayback = useCallback(async () => {
+    if (!isPlaying) {
+      void playQueue();
+      return;
+    }
+
+    if (!playerRef.current) return;
+
+    if (isPaused) {
+      setIsPaused(false);
+      setTtsStatus("Resuming...");
+      await playerRef.current.context.resume();
+      if (resumeResolverRef.current) {
+        resumeResolverRef.current();
+      }
+    } else {
+      setIsPaused(true);
+      setTtsStatus("Paused");
+      await playerRef.current.context.suspend();
+    }
+  }, [isPaused, isPlaying, playQueue]);
+
+  const indexSentences = useCallback(
+    (contents: any) => {
+      const doc = contents?.document as Document | undefined;
+      const root = (contents?.content || doc?.body) as HTMLElement | null;
+      if (!doc || !root) return;
+      if (processedDocsRef.current.has(doc)) return;
+      processedDocsRef.current.add(doc);
+
+      const sectionIndex =
+        typeof contents.sectionIndex === "number" ? contents.sectionIndex : 0;
+      const language =
+        doc.documentElement.lang ||
+        bookRef.current?.package?.metadata?.language ||
+        null;
+
+      const blocks = Array.from(root.querySelectorAll(BLOCK_SELECTOR)).filter(
+        (element) => {
+          if (element.closest("nav, aside")) return false;
+          const parentBlock = element.parentElement?.closest(BLOCK_SELECTOR);
+          return !parentBlock;
+        },
+      );
+
+      const entries: SentenceEntry[] = [];
+      let order = 0;
+
+      for (const block of blocks) {
+        const { fullText, map } = buildTextMap(doc, block);
+        if (!fullText.trim()) continue;
+
+        const segments = splitIntoSentences(fullText, language);
+        for (const segment of segments) {
+          const trimmed = trimOffsets(fullText, segment.start, segment.end);
+          if (trimmed.start >= trimmed.end) continue;
+
+          const range = rangeFromOffsets(doc, map, trimmed.start, trimmed.end);
+          if (!range || range.collapsed) continue;
+
+          const normalized = normalizeSentence(segment.text);
+          if (!normalized) continue;
+
+          let cfiRange: string;
+          try {
+            cfiRange = contents.cfiFromRange(range);
+          } catch {
+            continue;
+          }
+          const entry: SentenceEntry = {
+            id: `sentence-${sectionIndex}-${sentenceIdCounterRef.current++}`,
+            text: normalized,
+            cfiRange,
+            sectionIndex,
+            order,
+          };
+          entries.push(entry);
+          order += 1;
+        }
+      }
+
+      if (entries.length > 0) {
+        sentencesBySectionRef.current.set(sectionIndex, entries);
+        rebuildSentenceList();
+      }
+    },
+    [rebuildSentenceList],
+  );
 
   const handleFileChange = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
@@ -73,6 +597,7 @@ export function EpubReader() {
         }) as EpubRendition;
         renditionRef.current = rendition;
         rendition.flow("scrolled");
+        rendition.hooks?.content?.register(indexSentences);
         rendition.themes.default({
           body: {
             "font-family":
@@ -105,7 +630,7 @@ export function EpubReader() {
         setIsLoading(false);
       }
     },
-    [clearBook],
+    [clearBook, indexSentences],
   );
 
   const handleClear = useCallback(() => {
@@ -113,6 +638,12 @@ export function EpubReader() {
     setFileName(null);
     setError(null);
   }, [clearBook]);
+
+  const playbackLabel = useMemo(() => {
+    if (isPlaying && !isPaused) return "Pause";
+    if (isPlaying && isPaused) return "Resume";
+    return "Play";
+  }, [isPaused, isPlaying]);
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -136,22 +667,47 @@ export function EpubReader() {
           </Alert>
         )}
 
+        {ttsError && (
+          <Alert variant="destructive">
+            <AlertTitle>TTS error</AlertTitle>
+            <AlertDescription>{ttsError}</AlertDescription>
+          </Alert>
+        )}
+
         <section className="rounded-xl border bg-white p-5 shadow-sm">
           <div className="flex flex-col gap-4">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
               <div>
                 <p className="text-sm font-medium text-slate-700">Upload EPUB</p>
                 <p className="text-xs text-muted-foreground">
                   Choose an .epub file to start reading.
                 </p>
               </div>
-              <Button
-                variant="outline"
-                onClick={handleClear}
-                disabled={!fileName || isLoading}
-              >
-                Clear
-              </Button>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="outline"
+                  onClick={handleClear}
+                  disabled={!fileName || isLoading}
+                >
+                  Clear
+                </Button>
+                <Button
+                  onClick={handleTogglePlayback}
+                  disabled={
+                    isLoading ||
+                    !fileName ||
+                    sentenceCount === 0 ||
+                    webgpuSupported === false
+                  }
+                >
+                  {isPlaying && !isPaused ? (
+                    <Pause className="mr-2 h-4 w-4" />
+                  ) : (
+                    <Play className="mr-2 h-4 w-4" />
+                  )}
+                  {playbackLabel}
+                </Button>
+              </div>
             </div>
 
             <label
@@ -184,14 +740,20 @@ export function EpubReader() {
                 </span>
               )}
             </label>
+
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <span>{sentenceCount} sentences indexed</span>
+              {ttsStatus && <span>· {ttsStatus}</span>}
+              {webgpuSupported === false && (
+                <span>· WebGPU unavailable</span>
+              )}
+            </div>
           </div>
         </section>
 
         <section className="rounded-2xl border bg-white shadow-sm">
           <div className="border-b px-5 py-3">
-            <p className="text-sm font-medium text-slate-700">
-              Reader
-            </p>
+            <p className="text-sm font-medium text-slate-700">Reader</p>
             <p className="text-xs text-muted-foreground">
               Scroll to read. The content will fill this panel.
             </p>
