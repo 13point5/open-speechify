@@ -26,6 +26,11 @@ const HIGHLIGHT_STYLES = {
   "fill-opacity": "0.35",
   "mix-blend-mode": "multiply",
 };
+const HOVER_STYLES = {
+  fill: "#fef9c3",
+  "fill-opacity": "0.35",
+  "mix-blend-mode": "multiply",
+};
 
 type EpubRendition = {
   display: (target?: string) => Promise<void>;
@@ -49,6 +54,7 @@ type EpubRendition = {
     ) => unknown;
     remove: (cfiRange: string, type?: string) => void;
   };
+  on?: (event: string, handler: (...args: any[]) => void) => void;
 };
 
 type SentenceEntry = {
@@ -57,6 +63,13 @@ type SentenceEntry = {
   cfiRange: string;
   sectionIndex: number;
   order: number;
+};
+
+type TocItem = {
+  id?: string;
+  href: string;
+  label: string;
+  subitems: TocItem[];
 };
 
 type TextMapEntry = {
@@ -188,8 +201,14 @@ export function EpubReader() {
   const processedDocsRef = useRef<WeakSet<Document>>(new WeakSet());
   const sentencesBySectionRef = useRef<Map<number, SentenceEntry[]>>(new Map());
   const sentenceListRef = useRef<SentenceEntry[]>([]);
+  const sentenceIndexRef = useRef<Map<string, number>>(new Map());
+  const sentenceByIdRef = useRef<Map<string, SentenceEntry>>(new Map());
   const sentenceIdCounterRef = useRef(0);
   const activeHighlightRef = useRef<string | null>(null);
+  const hoverHighlightRef = useRef<string | null>(null);
+  const hoverSentenceIdRef = useRef<string | null>(null);
+  const interactiveDocsRef = useRef<WeakSet<Document>>(new WeakSet());
+  const currentSectionIndexRef = useRef<number | null>(null);
 
   const weightsRef = useRef<ReturnType<typeof safetensors.parse> | null>(null);
   const modelRef = useRef<PocketTTS | null>(null);
@@ -212,10 +231,17 @@ export function EpubReader() {
   const [ttsStatus, setTtsStatus] = useState<string | null>(null);
   const [ttsError, setTtsError] = useState<string | null>(null);
   const [webgpuSupported, setWebgpuSupported] = useState<boolean | null>(null);
+  const [toc, setToc] = useState<TocItem[]>([]);
+  const [activeChapterHref, setActiveChapterHref] = useState<string | null>(null);
+  const isPlayingRef = useRef(false);
 
   useEffect(() => {
     isPausedRef.current = isPaused;
   }, [isPaused]);
+
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
 
   useEffect(() => {
     let cancelled = false;
@@ -245,10 +271,16 @@ export function EpubReader() {
       ([a], [b]) => a - b,
     );
     const all: SentenceEntry[] = [];
+    const indexMap = new Map<string, number>();
     for (const [, entries] of sections) {
-      all.push(...entries.sort((a, b) => a.order - b.order));
+      const sorted = entries.sort((a, b) => a.order - b.order);
+      for (const entry of sorted) {
+        indexMap.set(entry.id, all.length);
+        all.push(entry);
+      }
     }
     sentenceListRef.current = all;
+    sentenceIndexRef.current = indexMap;
     setSentenceCount(all.length);
   }, []);
 
@@ -258,6 +290,31 @@ export function EpubReader() {
     rendition.annotations.remove(activeHighlightRef.current, "highlight");
     activeHighlightRef.current = null;
   }, []);
+
+  const clearHoverHighlight = useCallback(() => {
+    const rendition = renditionRef.current;
+    if (!rendition?.annotations || !hoverHighlightRef.current) return;
+    rendition.annotations.remove(hoverHighlightRef.current, "highlight");
+    hoverHighlightRef.current = null;
+    hoverSentenceIdRef.current = null;
+  }, []);
+
+  const resetSentenceIndex = useCallback(
+    (nextSectionIndex: number | null = null) => {
+      sentencesBySectionRef.current.clear();
+      sentenceListRef.current = [];
+      sentenceIndexRef.current = new Map();
+      sentenceByIdRef.current.clear();
+      sentenceIdCounterRef.current = 0;
+      playbackIndexRef.current = 0;
+      interactiveDocsRef.current = new WeakSet();
+      currentSectionIndexRef.current = nextSectionIndex;
+      setSentenceCount(0);
+      clearHighlight();
+      clearHoverHighlight();
+    },
+    [clearHighlight, clearHoverHighlight],
+  );
 
   const highlightSentence = useCallback((entry: SentenceEntry | null) => {
     const rendition = renditionRef.current;
@@ -279,8 +336,39 @@ export function EpubReader() {
     }
   }, []);
 
+
+  const hoverSentence = useCallback((entry: SentenceEntry | null) => {
+    const rendition = renditionRef.current;
+    if (!rendition?.annotations) return;
+    if (entry && hoverSentenceIdRef.current === entry.id) {
+      return;
+    }
+    if (!entry && !hoverSentenceIdRef.current) {
+      return;
+    }
+    if (hoverHighlightRef.current) {
+      rendition.annotations.remove(hoverHighlightRef.current, "highlight");
+    }
+    if (entry) {
+      rendition.annotations.highlight(
+        entry.cfiRange,
+        { id: entry.id, hover: true },
+        undefined,
+        "tts-hover",
+        HOVER_STYLES,
+      );
+      hoverHighlightRef.current = entry.cfiRange;
+      hoverSentenceIdRef.current = entry.id;
+    } else {
+      hoverHighlightRef.current = null;
+      hoverSentenceIdRef.current = null;
+    }
+  }, []);
+
+
   const stopPlayback = useCallback(() => {
     stopRequestedRef.current = true;
+    isPlayingRef.current = false;
     if (resumeResolverRef.current) {
       resumeResolverRef.current();
       resumeResolverRef.current = null;
@@ -293,6 +381,7 @@ export function EpubReader() {
       void playerRef.current.context.suspend();
     }
     clearHighlight();
+    clearHoverHighlight();
     setIsPlaying(false);
     setIsPaused(false);
     setTtsStatus(null);
@@ -312,14 +401,11 @@ export function EpubReader() {
       viewerRef.current.innerHTML = "";
     }
     processedDocsRef.current = new WeakSet();
-    sentencesBySectionRef.current.clear();
-    sentenceListRef.current = [];
-    sentenceIdCounterRef.current = 0;
-    playbackIndexRef.current = 0;
-    activeHighlightRef.current = null;
-    setSentenceCount(0);
     setTtsError(null);
-  }, [stopPlayback]);
+    resetSentenceIndex(null);
+    setToc([]);
+    setActiveChapterHref(null);
+  }, [resetSentenceIndex, stopPlayback]);
 
   useEffect(() => {
     return () => {
@@ -415,7 +501,7 @@ export function EpubReader() {
   }, []);
 
   const playQueue = useCallback(async () => {
-    if (isPlaying) return;
+    if (isPlayingRef.current) return;
     const sentences = sentenceListRef.current;
     if (!sentences.length) {
       setTtsError("No sentences found yet. Try scrolling to load more.");
@@ -423,6 +509,7 @@ export function EpubReader() {
     }
 
     stopRequestedRef.current = false;
+    isPlayingRef.current = true;
     setIsPlaying(true);
     setIsPaused(false);
     setTtsError(null);
@@ -454,6 +541,7 @@ export function EpubReader() {
         const entry = sentences[index];
         playbackIndexRef.current = index;
         await ensureSentenceVisible(entry);
+        clearHoverHighlight();
         highlightSentence(entry);
         setTtsStatus(`Reading ${index + 1} of ${sentences.length}`);
         await synthesizeSentence(entry.text, player);
@@ -474,11 +562,129 @@ export function EpubReader() {
       );
     } finally {
       stopResolverRef.current = null;
+      isPlayingRef.current = false;
       setIsPlaying(false);
       setIsPaused(false);
       setTtsStatus(null);
     }
-  }, [ensureSentenceVisible, ensureWebGpuReady, highlightSentence, isPlaying, synthesizeSentence]);
+  }, [clearHoverHighlight, ensureSentenceVisible, ensureWebGpuReady, highlightSentence, synthesizeSentence]);
+
+
+
+  const attachSentenceInteractivity = useCallback(
+    (contents: any) => {
+      const doc = contents?.document as Document | undefined;
+      if (!doc) return;
+      const rendition = renditionRef.current;
+      if (!rendition?.annotations) return;
+      if (interactiveDocsRef.current.has(doc)) return;
+      interactiveDocsRef.current.add(doc);
+
+      const sectionIndex =
+        typeof contents.sectionIndex === "number" ? contents.sectionIndex : 0;
+      const entries = sentencesBySectionRef.current.get(sectionIndex) ?? [];
+
+      const iframe = doc.defaultView?.frameElement as HTMLElement | null;
+      const container = iframe?.parentElement as HTMLElement | null;
+      if (!iframe || !container) return;
+
+      for (const entry of entries) {
+        if (container.querySelector(`[data-id='${entry.id}']`)) continue;
+        rendition.annotations.highlight(
+          entry.cfiRange,
+          { id: entry.id, hit: true },
+          undefined,
+          "tts-hit",
+          {
+            fill: "#000000",
+            "fill-opacity": "0",
+          },
+        );
+      }
+
+      const marks = container.querySelectorAll("[ref='tts-hit']");
+      marks.forEach((mark) => {
+        const markEl = mark as HTMLElement;
+        if (markEl.dataset.sentenceBound === "true") return;
+        markEl.dataset.sentenceBound = "true";
+        markEl.style.cursor = "pointer";
+        const sentenceId = markEl.dataset.id;
+
+        markEl.addEventListener("click", () => {
+          if (!sentenceId) return;
+          const index = sentenceIndexRef.current.get(sentenceId);
+          if (index === undefined) return;
+          playbackIndexRef.current = index;
+          stopRequestedRef.current = true;
+          if (stopResolverRef.current) {
+            stopResolverRef.current();
+            stopResolverRef.current = null;
+          }
+          stopPlayback();
+          setTimeout(() => {
+            void playQueue();
+          }, 0);
+        });
+      });
+
+      let rafId = 0;
+      let lastHoveredId: string | null = null;
+
+      const rectContains = (rect: DOMRect, x: number, y: number) => {
+        const offset = iframe.getBoundingClientRect();
+        const top = rect.top - offset.top;
+        const left = rect.left - offset.left;
+        const bottom = top + rect.height;
+        const right = left + rect.width;
+        return top <= y && left <= x && bottom > y && right > x;
+      };
+
+      const findHoverId = (x: number, y: number) => {
+        const hitMarks = Array.from(
+          container.querySelectorAll("[ref='tts-hit']"),
+        ) as HTMLElement[];
+        for (const markEl of hitMarks) {
+          const id = markEl.dataset.id;
+          if (!id) continue;
+          const rect = markEl.getBoundingClientRect();
+          if (!rectContains(rect, x, y)) continue;
+          const rects = markEl.getClientRects();
+          for (let i = 0; i < rects.length; i += 1) {
+            if (rectContains(rects[i], x, y)) {
+              return id;
+            }
+          }
+        }
+        return null;
+      };
+
+      const handleMove = (event: MouseEvent) => {
+        if (rafId) return;
+        const { clientX, clientY } = event;
+        rafId = window.requestAnimationFrame(() => {
+          rafId = 0;
+          const hoverId = findHoverId(clientX, clientY);
+          if (hoverId === lastHoveredId) return;
+          lastHoveredId = hoverId;
+          if (!hoverId) {
+            hoverSentence(null);
+            return;
+          }
+          const entry = sentenceByIdRef.current.get(hoverId) ?? null;
+          hoverSentence(entry);
+        });
+      };
+
+      const handleLeave = () => {
+        lastHoveredId = null;
+        hoverSentence(null);
+      };
+
+      doc.addEventListener("mousemove", handleMove);
+      doc.addEventListener("mouseleave", handleLeave);
+    },
+    [hoverSentence, playQueue, stopPlayback],
+  );
 
   const handleTogglePlayback = useCallback(async () => {
     if (!isPlaying) {
@@ -502,6 +708,7 @@ export function EpubReader() {
     }
   }, [isPaused, isPlaying, playQueue]);
 
+
   const indexSentences = useCallback(
     (contents: any) => {
       const doc = contents?.document as Document | undefined;
@@ -516,6 +723,10 @@ export function EpubReader() {
         doc.documentElement.lang ||
         bookRef.current?.package?.metadata?.language ||
         null;
+
+      if (currentSectionIndexRef.current !== sectionIndex) {
+        resetSentenceIndex(sectionIndex);
+      }
 
       const blocks = Array.from(root.querySelectorAll(BLOCK_SELECTOR)).filter(
         (element) => {
@@ -557,6 +768,7 @@ export function EpubReader() {
             order,
           };
           entries.push(entry);
+          sentenceByIdRef.current.set(entry.id, entry);
           order += 1;
         }
       }
@@ -566,7 +778,7 @@ export function EpubReader() {
         rebuildSentenceList();
       }
     },
-    [rebuildSentenceList],
+    [rebuildSentenceList, resetSentenceIndex],
   );
 
   const handleFileChange = useCallback(
@@ -576,6 +788,8 @@ export function EpubReader() {
 
       setError(null);
       setFileName(null);
+      setActiveChapterHref(null);
+      setToc([]);
       setIsLoading(true);
       clearBook();
 
@@ -591,13 +805,16 @@ export function EpubReader() {
         const rendition = book.renderTo(viewerRef.current, {
           width: "100%",
           height: "100%",
-          flow: "scrolled",
-          manager: "continuous",
+          flow: "scrolled-doc",
+          manager: "default",
           allowScriptedContent: true,
         }) as EpubRendition;
         renditionRef.current = rendition;
-        rendition.flow("scrolled");
-        rendition.hooks?.content?.register(indexSentences);
+        rendition.flow("scrolled-doc");
+        rendition.hooks?.content?.register((contents: any) => {
+          indexSentences(contents);
+          attachSentenceInteractivity(contents);
+        });
         rendition.themes.default({
           body: {
             "font-family":
@@ -616,11 +833,17 @@ export function EpubReader() {
 
         await rendition.display();
 
-        const manager = (rendition as { manager?: any }).manager;
-        if (manager) {
-          manager.isVisible = () => true;
-          manager.trim = () => Promise.resolve();
-        }
+        const navigation = await book.loaded?.navigation;
+        const tocItems = (navigation?.toc ?? []) as TocItem[];
+        setToc(tocItems);
+
+        rendition.on?.("relocated", (location: any) => {
+          const href = location?.start?.href as string | undefined;
+          if (href) {
+            setActiveChapterHref(href.split("#")[0]);
+          }
+        });
+
         setFileName(file.name);
       } catch (loadError) {
         setError(
@@ -630,7 +853,7 @@ export function EpubReader() {
         setIsLoading(false);
       }
     },
-    [clearBook, indexSentences],
+    [attachSentenceInteractivity, clearBook, indexSentences],
   );
 
   const handleClear = useCallback(() => {
@@ -638,6 +861,50 @@ export function EpubReader() {
     setFileName(null);
     setError(null);
   }, [clearBook]);
+
+  const handleChapterClick = useCallback(
+    (href: string) => {
+      const rendition = renditionRef.current;
+      if (!rendition) return;
+      stopPlayback();
+      resetSentenceIndex(null);
+      void rendition.display(href);
+      setActiveChapterHref(href.split("#")[0]);
+    },
+    [resetSentenceIndex, stopPlayback],
+  );
+
+  const renderTocItems = (items: TocItem[], depth = 0) => {
+    if (!items.length) return null;
+    return (
+      <ul className={depth === 0 ? "space-y-1" : "mt-1 space-y-1"}>
+        {items.map((item) => {
+          const label = item.label || "Untitled";
+          const href = item.href || "";
+          const baseHref = href.split("#")[0];
+          const isActive = activeChapterHref === baseHref;
+          return (
+            <li key={`${href}-${label}-${depth}`}>
+              <button
+                type="button"
+                onClick={() => handleChapterClick(href)}
+                className={`flex w-full items-start gap-2 rounded-md px-2 py-1 text-left text-sm transition-colors ${
+                  isActive
+                    ? "bg-slate-100 text-slate-900"
+                    : "text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                }`}
+                disabled={!href}
+                style={{ paddingLeft: `${8 + depth * 12}px` }}
+              >
+                <span className="block leading-snug">{label}</span>
+              </button>
+              {item.subitems?.length > 0 && renderTocItems(item.subitems, depth + 1)}
+            </li>
+          );
+        })}
+      </ul>
+    );
+  };
 
   const playbackLabel = useMemo(() => {
     if (isPlaying && !isPaused) return "Pause";
@@ -647,18 +914,73 @@ export function EpubReader() {
 
   return (
     <div className="min-h-screen bg-slate-50">
-      <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-6 py-10">
-        <header className="space-y-2">
-          <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
-            Epub Reader
-          </p>
-          <h1 className="text-3xl font-semibold tracking-tight text-slate-900">
-            Continuous reading view
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Upload an EPUB file to render it in a scrollable reading surface.
-          </p>
-        </header>
+      <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 px-6 py-6">
+        <div className="rounded-xl border bg-white px-4 py-3 shadow-sm">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900 text-xs font-semibold text-white">
+                OS
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-slate-900">
+                  Open Speech Reader
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {fileName ?? "No EPUB loaded"}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <label
+                className={`inline-flex cursor-pointer items-center gap-2 rounded-md border-2 border-dashed px-3 py-2 text-xs font-medium transition-colors ${
+                  isLoading
+                    ? "cursor-not-allowed border-slate-200 bg-slate-50 text-slate-400"
+                    : "border-slate-200 bg-slate-50/60 text-slate-700 hover:border-slate-300 hover:bg-slate-50"
+                }`}
+                aria-disabled={isLoading}
+              >
+                <input
+                  type="file"
+                  accept=".epub,application/epub+zip"
+                  onChange={handleFileChange}
+                  disabled={isLoading}
+                  className="sr-only"
+                />
+                <UploadCloud className="h-4 w-4" />
+                {fileName ? "Replace EPUB" : "Upload EPUB"}
+              </label>
+              <Button
+                variant="outline"
+                onClick={handleClear}
+                disabled={!fileName || isLoading}
+              >
+                Clear
+              </Button>
+              <Button
+                onClick={handleTogglePlayback}
+                disabled={
+                  isLoading ||
+                  !fileName ||
+                  sentenceCount === 0 ||
+                  webgpuSupported === false
+                }
+              >
+                {isPlaying && !isPaused ? (
+                  <Pause className="mr-2 h-4 w-4" />
+                ) : (
+                  <Play className="mr-2 h-4 w-4" />
+                )}
+                {playbackLabel}
+              </Button>
+            </div>
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span>{sentenceCount} sentences indexed</span>
+            {ttsStatus && <span>· {ttsStatus}</span>}
+            {webgpuSupported === false && <span>· WebGPU unavailable</span>}
+            <span>· Hover a sentence to preview, click to start</span>
+          </div>
+        </div>
 
         {error && (
           <Alert variant="destructive">
@@ -674,107 +996,47 @@ export function EpubReader() {
           </Alert>
         )}
 
-        <section className="rounded-xl border bg-white p-5 shadow-sm">
-          <div className="flex flex-col gap-4">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-              <div>
-                <p className="text-sm font-medium text-slate-700">Upload EPUB</p>
+        <div className="grid gap-4 lg:grid-cols-[240px_1fr]">
+          <aside className="rounded-xl border bg-white p-4 shadow-sm">
+            <div className="mb-2 flex items-center justify-between">
+              <p className="text-sm font-medium text-slate-700">Chapters</p>
+            </div>
+            <div className="max-h-[70vh] overflow-y-auto pr-1 text-sm">
+              {toc.length ? (
+                renderTocItems(toc)
+              ) : (
                 <p className="text-xs text-muted-foreground">
-                  Choose an .epub file to start reading.
+                  No chapters found.
                 </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  variant="outline"
-                  onClick={handleClear}
-                  disabled={!fileName || isLoading}
-                >
-                  Clear
-                </Button>
-                <Button
-                  onClick={handleTogglePlayback}
-                  disabled={
-                    isLoading ||
-                    !fileName ||
-                    sentenceCount === 0 ||
-                    webgpuSupported === false
-                  }
-                >
-                  {isPlaying && !isPaused ? (
-                    <Pause className="mr-2 h-4 w-4" />
-                  ) : (
-                    <Play className="mr-2 h-4 w-4" />
-                  )}
-                  {playbackLabel}
-                </Button>
-              </div>
+              )}
             </div>
+          </aside>
 
-            <label
-              className={`group flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-4 py-8 text-center transition-colors ${
-                isLoading
-                  ? "cursor-not-allowed border-slate-200 bg-slate-50 text-slate-400"
-                  : "border-slate-200 bg-slate-50/60 text-slate-600 hover:border-slate-300 hover:bg-slate-50"
-              }`}
-              aria-disabled={isLoading}
-            >
-              <input
-                type="file"
-                accept=".epub,application/epub+zip"
-                onChange={handleFileChange}
-                disabled={isLoading}
-                className="sr-only"
+          <section className="rounded-2xl border bg-white shadow-sm">
+            <div className="border-b px-5 py-3">
+              <p className="text-sm font-medium text-slate-700">Reader</p>
+              <p className="text-xs text-muted-foreground">
+                Scroll to read. Hover a sentence to preview, click to start there.
+              </p>
+            </div>
+            <div className="p-6">
+              <div
+                ref={viewerRef}
+                className="relative h-[75vh] rounded-lg bg-slate-50/70"
               />
-              <span className="inline-flex items-center justify-center rounded-full bg-white p-3 shadow-sm ring-1 ring-slate-200">
-                <UploadCloud className="h-5 w-5" />
-              </span>
-              <span className="mt-3 text-sm font-medium text-slate-700">
-                Drop your EPUB here
-              </span>
-              <span className="mt-1 text-xs text-muted-foreground">
-                or click to browse
-              </span>
-              {fileName && (
-                <span className="mt-3 text-xs text-slate-500">
-                  Loaded: {fileName}
-                </span>
+              {!fileName && !isLoading && (
+                <div className="mt-6 rounded-lg border border-dashed bg-slate-50 px-4 py-6 text-center text-sm text-muted-foreground">
+                  Upload an EPUB to start reading.
+                </div>
               )}
-            </label>
-
-            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <span>{sentenceCount} sentences indexed</span>
-              {ttsStatus && <span>· {ttsStatus}</span>}
-              {webgpuSupported === false && (
-                <span>· WebGPU unavailable</span>
+              {isLoading && (
+                <div className="mt-6 text-sm text-muted-foreground">
+                  Loading EPUB...
+                </div>
               )}
             </div>
-          </div>
-        </section>
-
-        <section className="rounded-2xl border bg-white shadow-sm">
-          <div className="border-b px-5 py-3">
-            <p className="text-sm font-medium text-slate-700">Reader</p>
-            <p className="text-xs text-muted-foreground">
-              Scroll to read. The content will fill this panel.
-            </p>
-          </div>
-          <div className="p-6">
-            <div
-              ref={viewerRef}
-              className="relative h-[70vh] rounded-lg bg-slate-50/70"
-            />
-            {!fileName && !isLoading && (
-              <div className="mt-6 rounded-lg border border-dashed bg-slate-50 px-4 py-6 text-center text-sm text-muted-foreground">
-                Drop in an EPUB file to begin reading.
-              </div>
-            )}
-            {isLoading && (
-              <div className="mt-6 text-sm text-muted-foreground">
-                Loading EPUB...
-              </div>
-            )}
-          </div>
-        </section>
+          </section>
+        </div>
       </div>
     </div>
   );
