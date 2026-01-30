@@ -1,4 +1,5 @@
-@import url("https://fonts.googleapis.com/css2?family=Literata:opsz,wght@7..72,400;7..72,600&display=swap");
+@import "@fontsource/geist/400.css";
+@import "@fontsource/geist/600.css";
 
 @tailwind base;
 @tailwind components;
@@ -66,7 +67,6 @@
     @apply border-border;
   }
   body {
-    @apply bg-background text-foreground;
-    font-family: "Literata", "Georgia", serif;
+    @apply bg-background text-foreground font-sans;
   }
 }
