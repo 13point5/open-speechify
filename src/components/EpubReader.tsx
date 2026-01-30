@@ -287,6 +287,7 @@ export function EpubReader() {
   const clearHighlight = useCallback(() => {
     const rendition = renditionRef.current;
     if (!rendition?.annotations || !activeHighlightRef.current) return;
+    console.log("🧹 Clearing active highlight:", activeHighlightRef.current);
     rendition.annotations.remove(activeHighlightRef.current, "highlight");
     activeHighlightRef.current = null;
   }, []);
@@ -320,9 +321,11 @@ export function EpubReader() {
     const rendition = renditionRef.current;
     if (!rendition?.annotations) return;
     if (activeHighlightRef.current) {
+      console.log("🧹 Removing previous highlight:", activeHighlightRef.current);
       rendition.annotations.remove(activeHighlightRef.current, "highlight");
     }
     if (entry) {
+      console.log("✨ Highlighting sentence:", entry.text.substring(0, 50) + "...", "cfi:", entry.cfiRange);
       rendition.annotations.highlight(
         entry.cfiRange,
         { id: entry.id },
@@ -332,6 +335,7 @@ export function EpubReader() {
       );
       activeHighlightRef.current = entry.cfiRange;
     } else {
+      console.log("❌ No entry to highlight");
       activeHighlightRef.current = null;
     }
   }, []);
@@ -367,6 +371,7 @@ export function EpubReader() {
 
 
   const stopPlayback = useCallback(() => {
+    console.log("🛑 stopPlayback called");
     stopRequestedRef.current = true;
     isPlayingRef.current = false;
     if (resumeResolverRef.current) {
@@ -501,9 +506,15 @@ export function EpubReader() {
   }, []);
 
   const playQueue = useCallback(async () => {
-    if (isPlayingRef.current) return;
+    console.log("🎵 playQueue called, isPlayingRef.current:", isPlayingRef.current);
+    if (isPlayingRef.current) {
+      console.log("❌ Already playing, returning");
+      return;
+    }
     const sentences = sentenceListRef.current;
+    console.log("📝 Available sentences:", sentences.length);
     if (!sentences.length) {
+      console.log("❌ No sentences available");
       setTtsError("No sentences found yet. Try scrolling to load more.");
       return;
     }
@@ -573,23 +584,86 @@ export function EpubReader() {
 
   const attachSentenceInteractivity = useCallback(
     (contents: any) => {
+      console.log("🔗 attachSentenceInteractivity called");
       const doc = contents?.document as Document | undefined;
-      if (!doc) return;
+      if (!doc) {
+        console.log("❌ No document found");
+        return;
+      }
       const rendition = renditionRef.current;
-      if (!rendition?.annotations) return;
-      if (interactiveDocsRef.current.has(doc)) return;
+      if (!rendition?.annotations) {
+        console.log("❌ No annotations available");
+        return;
+      }
+      if (interactiveDocsRef.current.has(doc)) {
+        console.log("⏭️ Document already processed");
+        return;
+      }
       interactiveDocsRef.current.add(doc);
+      console.log("✅ Document added to interactive set");
 
       const sectionIndex =
         typeof contents.sectionIndex === "number" ? contents.sectionIndex : 0;
       const entries = sentencesBySectionRef.current.get(sectionIndex) ?? [];
+      console.log(`📖 Section ${sectionIndex}: found ${entries.length} sentences`);
 
       const iframe = doc.defaultView?.frameElement as HTMLElement | null;
       const container = iframe?.parentElement as HTMLElement | null;
-      if (!iframe || !container) return;
+      if (!iframe || !container) {
+        console.log("❌ No iframe or container found");
+        return;
+      }
+      console.log("✅ Found iframe and container");
 
+      const startPlaybackFromSentence = (selectedId: string | null, source: string) => {
+        console.log("🖱️ Sentence click source:", source, "id:", selectedId);
+        if (!selectedId) {
+          console.log("❌ No sentenceId");
+          return;
+        }
+
+        const index = sentenceIndexRef.current.get(selectedId);
+        if (index === undefined) {
+          console.log("❌ No index found for sentenceId:", selectedId);
+          return;
+        }
+
+        console.log("📍 Starting playback from index:", index, "sentenceId:", selectedId);
+        console.log("🗂️ sentenceIndexRef contents:", Array.from(sentenceIndexRef.current.entries()));
+        console.log("🎯 Current playbackIndexRef before:", playbackIndexRef.current);
+
+        playbackIndexRef.current = index;
+        console.log("🎯 Current playbackIndexRef after:", playbackIndexRef.current);
+
+        stopRequestedRef.current = true;
+        if (stopResolverRef.current) {
+          console.log("🛑 Resolving stop promise");
+          stopResolverRef.current();
+          stopResolverRef.current = null;
+        }
+
+        if (playerRef.current?.context?.state === "running") {
+          console.log("🔇 Suspending audio context");
+          void playerRef.current.context.suspend();
+        }
+        clearHighlight();
+        clearHoverHighlight();
+
+        setIsPlaying(false);
+        setIsPaused(false);
+        setTtsStatus(null);
+
+        console.log("🚀 Starting new playback queue after timeout");
+        setTimeout(() => {
+          console.log("⏰ Timeout triggered, calling playQueue()");
+          void playQueue();
+        }, 100);
+      };
+
+      console.log(`🎯 Processing ${entries.length} sentences for interactivity`);
       for (const entry of entries) {
         if (container.querySelector(`[data-id='${entry.id}']`)) continue;
+        console.log(`🏷️ Adding hit detection for sentence: ${entry.id} - "${entry.text.substring(0, 30)}..."`);
         rendition.annotations.highlight(
           entry.cfiRange,
           { id: entry.id, hit: true },
@@ -603,6 +677,7 @@ export function EpubReader() {
       }
 
       const marks = container.querySelectorAll("[ref='tts-hit']");
+      console.log(`🎯 Found ${marks.length} tts-hit marks to add click listeners`);
       marks.forEach((mark) => {
         const markEl = mark as HTMLElement;
         if (markEl.dataset.sentenceBound === "true") return;
@@ -610,20 +685,10 @@ export function EpubReader() {
         markEl.style.cursor = "pointer";
         const sentenceId = markEl.dataset.id;
 
-        markEl.addEventListener("click", () => {
-          if (!sentenceId) return;
-          const index = sentenceIndexRef.current.get(sentenceId);
-          if (index === undefined) return;
-          playbackIndexRef.current = index;
-          stopRequestedRef.current = true;
-          if (stopResolverRef.current) {
-            stopResolverRef.current();
-            stopResolverRef.current = null;
-          }
-          stopPlayback();
-          setTimeout(() => {
-            void playQueue();
-          }, 100);
+        console.log(`👂 Adding click listener to sentence: ${sentenceId}`);
+        markEl.addEventListener("click", (e) => {
+          console.log("🖱️ Sentence clicked (mark):", { sentenceId, e });
+          startPlaybackFromSentence(sentenceId ?? null, "mark");
         });
       });
 
@@ -658,6 +723,16 @@ export function EpubReader() {
         return null;
       };
 
+      const handleClick = (event: MouseEvent) => {
+        const clickedId = findHoverId(event.clientX, event.clientY);
+        console.log("🖱️ Document click detected:", {
+          clickedId,
+          clientX: event.clientX,
+          clientY: event.clientY,
+        });
+        startPlaybackFromSentence(clickedId, "document");
+      };
+
       const handleMove = (event: MouseEvent) => {
         if (rafId) return;
         const { clientX, clientY } = event;
@@ -680,8 +755,11 @@ export function EpubReader() {
         hoverSentence(null);
       };
 
+      console.log("🖱️ Adding mouse event listeners to document");
+      console.log("🖱️ Adding click listener to document (capture)");
       doc.addEventListener("mousemove", handleMove);
       doc.addEventListener("mouseleave", handleLeave);
+      doc.addEventListener("click", handleClick, true);
     },
     [hoverSentence, playQueue, stopPlayback],
   );
@@ -812,6 +890,7 @@ export function EpubReader() {
         renditionRef.current = rendition;
         rendition.flow("scrolled-doc");
         rendition.hooks?.content?.register((contents: any) => {
+          console.log("🔗 Content hook triggered");
           indexSentences(contents);
           attachSentenceInteractivity(contents);
         });
