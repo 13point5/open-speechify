@@ -2,7 +2,7 @@ import type { ChangeEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ePub from "epubjs";
 import { defaultDevice, init, numpy as np, tree } from "@jax-js/jax";
-import { cachedFetch, safetensors, tokenizers } from "@jax-js/loaders";
+import { cachedFetch, opfs, safetensors, tokenizers } from "@jax-js/loaders";
 import { Pause, Play, UploadCloud } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -30,6 +30,11 @@ const HOVER_STYLES = {
   fill: "#fef9c3",
   "fill-opacity": "0.35",
   "mix-blend-mode": "multiply",
+};
+
+type FetchProgress = {
+  loadedBytes: number;
+  totalBytes?: number;
 };
 
 type EpubRendition = {
@@ -194,6 +199,26 @@ function prepareTextPrompt(text: string): [string, number] {
 }
 
 export function EpubReader() {
+  const withTimeout = useCallback(
+    async <T,>(promise: Promise<T>, timeoutMs: number, message: string) => {
+      let timeoutId: number | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = window.setTimeout(() => {
+          reject(new Error(message));
+        }, timeoutMs);
+      });
+
+      try {
+        return await Promise.race([promise, timeoutPromise]);
+      } finally {
+        if (timeoutId !== undefined) {
+          window.clearTimeout(timeoutId);
+        }
+      }
+    },
+    [],
+  );
+
   const viewerRef = useRef<HTMLDivElement | null>(null);
   const bookRef = useRef<any>(null);
   const renditionRef = useRef<EpubRendition | null>(null);
@@ -231,6 +256,13 @@ export function EpubReader() {
   const [ttsStatus, setTtsStatus] = useState<string | null>(null);
   const [ttsError, setTtsError] = useState<string | null>(null);
   const [webgpuSupported, setWebgpuSupported] = useState<boolean | null>(null);
+  const [modelStatus, setModelStatus] = useState<string | null>(
+    "Preparing TTS model...",
+  );
+  const [modelProgress, setModelProgress] = useState<number | null>(null);
+  const [modelReady, setModelReady] = useState(false);
+  const [modelFailed, setModelFailed] = useState(false);
+  const [modelRetryToken, setModelRetryToken] = useState(0);
   const [toc, setToc] = useState<TocItem[]>([]);
   const [activeChapterHref, setActiveChapterHref] = useState<string | null>(null);
   const isPlayingRef = useRef(false);
@@ -265,6 +297,7 @@ export function EpubReader() {
       cancelled = true;
     };
   }, []);
+
 
   const rebuildSentenceList = useCallback(() => {
     const sections = Array.from(sentencesBySectionRef.current.entries()).sort(
@@ -423,7 +456,11 @@ export function EpubReader() {
       throw new Error("WebGPU is not available on this device.");
     }
     if (!webgpuInitializedRef.current) {
-      const devices = await init();
+      const devices = await withTimeout(
+        init("webgpu"),
+        10000,
+        "WebGPU initialization timed out.",
+      );
       if (!devices.includes("webgpu")) {
         setWebgpuSupported(false);
         throw new Error("WebGPU is not available on this device.");
@@ -432,12 +469,12 @@ export function EpubReader() {
       webgpuInitializedRef.current = true;
       setWebgpuSupported(true);
     }
-  }, [webgpuSupported]);
+  }, [webgpuSupported, withTimeout]);
 
-  const downloadWeights = useCallback(async () => {
+  const downloadWeights = useCallback(async (onProgress?: (progress: FetchProgress) => void) => {
     if (weightsRef.current) return weightsRef.current;
     setTtsStatus("Downloading model weights...");
-    const data = await cachedFetch(WEIGHTS_URL);
+    const data = await cachedFetch(WEIGHTS_URL, undefined, onProgress);
     const parsed = safetensors.parse(data);
     weightsRef.current = parsed;
     return parsed;
@@ -486,6 +523,105 @@ export function EpubReader() {
     voiceEmbedRef.current = voiceEmbed;
     return voiceEmbed;
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timedOut = false;
+    setModelReady(false);
+    setModelFailed(false);
+    setModelProgress(null);
+    setModelStatus("Preparing WebGPU...");
+
+    const timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      cancelled = true;
+      setModelStatus("WebGPU initialization timed out.");
+      setModelProgress(null);
+      setModelFailed(true);
+      setModelReady(true);
+      setWebgpuSupported(false);
+    }, 12000);
+
+    const preload = async () => {
+      try {
+        await ensureWebGpuReady();
+        if (cancelled) return;
+        window.clearTimeout(timeoutId);
+
+        let weightsCached = false;
+        let tokenizerCached = false;
+        let voiceCached = false;
+
+        try {
+          weightsCached = Boolean(await opfs.info(WEIGHTS_URL));
+          tokenizerCached = Boolean(await opfs.info(TOKENIZER_URL));
+          voiceCached = Boolean(await opfs.info(DEFAULT_VOICE_URL));
+        } catch {
+          weightsCached = false;
+          tokenizerCached = false;
+          voiceCached = false;
+        }
+
+        const needsDownload = !(weightsCached && tokenizerCached && voiceCached);
+        setModelStatus(
+          needsDownload
+            ? "Downloading TTS model..."
+            : "Loading cached TTS model...",
+        );
+        setModelProgress(needsDownload ? 0 : null);
+        await downloadWeights(
+          needsDownload
+            ? (progress) => {
+                if (cancelled) return;
+                if (progress.totalBytes) {
+                  setModelProgress(progress.loadedBytes / progress.totalBytes);
+                }
+              }
+            : undefined,
+        );
+        if (cancelled) return;
+
+        setModelStatus("Loading TTS model...");
+        await getModel();
+        if (cancelled) return;
+
+        setModelStatus("Loading tokenizer...");
+        await getTokenizer();
+        if (cancelled) return;
+
+        setModelStatus("Loading voice preset...");
+        await getVoiceEmbed();
+        if (cancelled) return;
+
+        setModelStatus(null);
+        setModelProgress(null);
+        setModelReady(true);
+        setTtsStatus(null);
+      } catch (loadError) {
+        if (cancelled) return;
+        window.clearTimeout(timeoutId);
+        const message =
+          loadError instanceof Error
+            ? loadError.message
+            : "Failed to load TTS model.";
+        setModelStatus(message);
+        setModelProgress(null);
+        setModelFailed(true);
+        if (message.toLowerCase().includes("webgpu")) {
+          setModelReady(true);
+          setWebgpuSupported(false);
+        }
+      }
+    };
+
+    void preload();
+    return () => {
+      cancelled = true;
+      if (!timedOut) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [downloadWeights, ensureWebGpuReady, getModel, getTokenizer, getVoiceEmbed, modelRetryToken]);
 
   const synthesizeSentence = useCallback(
     async (text: string, player: AudioPlayer) => {
@@ -1000,7 +1136,20 @@ export function EpubReader() {
     return "Play";
   }, [isPaused, isPlaying]);
 
+  const uploadDisabled = isLoading || !modelReady;
+  const modelPercent =
+    modelProgress === null ? null : Math.round(modelProgress * 100);
+
   const showReaderHeader = !activeChapterHref;
+  const showModelStatus = Boolean(modelStatus && (!modelReady || modelFailed));
+  const sessionMessage =
+    ttsStatus ??
+    (fileName
+      ? "Click a sentence to start listening."
+      : "Upload an EPUB to begin.");
+  const handleRetryModel = useCallback(() => {
+    setModelRetryToken((prev) => prev + 1);
+  }, []);
 
   return (
     <div className="h-screen overflow-hidden bg-slate-50">
@@ -1013,7 +1162,7 @@ export function EpubReader() {
               </div>
               <div>
                 <p className="text-sm font-semibold text-slate-900">
-                  Open Speech Reader
+                  Open Speechify
                 </p>
                 <p className="text-xs text-muted-foreground">
                   {fileName ?? "No EPUB loaded"}
@@ -1023,21 +1172,25 @@ export function EpubReader() {
             <div className="flex flex-wrap items-center gap-2">
               <label
                 className={`inline-flex cursor-pointer items-center gap-2 rounded-md border-2 border-dashed px-3 py-2 text-xs font-medium transition-colors ${
-                  isLoading
+                  uploadDisabled
                     ? "cursor-not-allowed border-slate-200 bg-slate-50 text-slate-400"
                     : "border-slate-200 bg-slate-50/60 text-slate-700 hover:border-slate-300 hover:bg-slate-50"
                 }`}
-                aria-disabled={isLoading}
+                aria-disabled={uploadDisabled}
               >
                 <input
                   type="file"
                   accept=".epub,application/epub+zip"
                   onChange={handleFileChange}
-                  disabled={isLoading}
+                  disabled={uploadDisabled}
                   className="sr-only"
                 />
                 <UploadCloud className="h-4 w-4" />
-                {fileName ? "Replace EPUB" : "Upload EPUB"}
+                {fileName
+                  ? "Replace EPUB"
+                  : modelReady
+                    ? "Upload EPUB"
+                    : "Preparing speech"}
               </label>
               <Button
                 variant="outline"
@@ -1052,7 +1205,8 @@ export function EpubReader() {
                   isLoading ||
                   !fileName ||
                   sentenceCount === 0 ||
-                  webgpuSupported === false
+                  webgpuSupported === false ||
+                  !modelReady
                 }
               >
                 {isPlaying && !isPaused ? (
@@ -1065,11 +1219,38 @@ export function EpubReader() {
             </div>
           </div>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-            <span>{sentenceCount} sentences indexed</span>
-            {ttsStatus && <span>· {ttsStatus}</span>}
-            {webgpuSupported === false && <span>· WebGPU unavailable</span>}
-            <span>· Hover a sentence to preview, click to start</span>
+            <span>{sessionMessage}</span>
+            {webgpuSupported === false && (
+              <span>· Speech engine unavailable on this device</span>
+            )}
           </div>
+          {showModelStatus && (
+            <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+              <div className="flex items-center justify-between text-xs text-slate-600">
+                <span>{modelStatus}</span>
+                {modelPercent !== null && <span>{modelPercent}%</span>}
+              </div>
+              {modelPercent !== null && (
+                <div className="mt-2 h-1.5 w-full rounded-full bg-slate-200">
+                  <div
+                    className="h-1.5 rounded-full bg-slate-900 transition-[width]"
+                    style={{ width: `${Math.max(2, Math.min(100, modelPercent))}%` }}
+                  />
+                </div>
+              )}
+              {modelFailed && (
+                <div className="mt-2 flex items-center justify-end">
+                  <button
+                    type="button"
+                    onClick={handleRetryModel}
+                    className="text-xs font-medium text-slate-700 hover:text-slate-900"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {error && (
