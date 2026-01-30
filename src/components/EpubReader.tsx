@@ -991,9 +991,11 @@ export function EpubReader() {
     return "Play";
   }, [isPaused, isPlaying]);
 
+  const showReaderHeader = !activeChapterHref;
+
   return (
-    <div className="min-h-screen bg-slate-50">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 px-6 py-6">
+    <div className="h-screen overflow-hidden bg-slate-50">
+      <div className="mx-auto flex h-full w-full max-w-7xl flex-col gap-4 px-6 py-4">
         <div className="rounded-xl border bg-white px-4 py-3 shadow-sm">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex items-center gap-3">
@@ -1075,12 +1077,12 @@ export function EpubReader() {
           </Alert>
         )}
 
-        <div className="grid gap-4 lg:grid-cols-[240px_1fr]">
-          <aside className="rounded-xl border bg-white p-4 shadow-sm">
+        <div className="grid flex-1 min-h-0 gap-4 lg:grid-cols-[240px_1fr]">
+          <aside className="flex min-h-0 flex-col rounded-xl border bg-white p-4 shadow-sm">
             <div className="mb-2 flex items-center justify-between">
               <p className="text-sm font-medium text-slate-700">Chapters</p>
             </div>
-            <div className="max-h-[70vh] overflow-y-auto pr-1 text-sm">
+            <div className="flex-1 min-h-0 overflow-y-auto pr-1 text-sm">
               {toc.length ? (
                 renderTocItems(toc)
               ) : (
@@ -1091,28 +1093,35 @@ export function EpubReader() {
             </div>
           </aside>
 
-          <section className="rounded-2xl border bg-white shadow-sm">
-            <div className="border-b px-5 py-3">
-              <p className="text-sm font-medium text-slate-700">Reader</p>
-              <p className="text-xs text-muted-foreground">
-                Scroll to read. Hover a sentence to preview, click to start there.
-              </p>
-            </div>
-            <div className="p-6">
+          <section className="flex min-h-0 flex-col rounded-2xl border bg-white shadow-sm">
+            {showReaderHeader && (
+              <div className="border-b px-5 py-3">
+                <p className="text-sm font-medium text-slate-700">Reader</p>
+                <p className="text-xs text-muted-foreground">
+                  Scroll to read. Hover a sentence to preview, click to start there.
+                </p>
+              </div>
+            )}
+            <div className={`flex-1 min-h-0 ${showReaderHeader ? "p-6" : "p-0"}`}>
               <div
-                ref={viewerRef}
-                className="relative h-[75vh] rounded-lg bg-slate-50/70"
-              />
-              {!fileName && !isLoading && (
-                <div className="mt-6 rounded-lg border border-dashed bg-slate-50 px-4 py-6 text-center text-sm text-muted-foreground">
-                  Upload an EPUB to start reading.
-                </div>
-              )}
-              {isLoading && (
-                <div className="mt-6 text-sm text-muted-foreground">
-                  Loading EPUB...
-                </div>
-              )}
+                className={`relative h-full overflow-hidden bg-slate-50 ${
+                  showReaderHeader ? "rounded-lg" : "rounded-2xl"
+                }`}
+              >
+                <div ref={viewerRef} className="absolute inset-0" />
+                {!fileName && !isLoading && (
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="rounded-lg border border-dashed bg-slate-50 px-4 py-6 text-center text-sm text-muted-foreground">
+                      Upload an EPUB to start reading.
+                    </div>
+                  </div>
+                )}
+                {isLoading && (
+                  <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
+                    Loading EPUB...
+                  </div>
+                )}
+              </div>
             </div>
           </section>
         </div>
